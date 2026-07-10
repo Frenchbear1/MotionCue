@@ -126,7 +126,14 @@ function App() {
     () => roomSnapshot ?? rooms.find((room) => room.id === selectedRoomId) ?? null,
     [roomSnapshot, rooms, selectedRoomId],
   )
+  const activeRoomId = activeRoom?.id ?? null
   const localClips = useLocalClips(activeRoom?.id ?? null)
+  const {
+    clips,
+    estimate: storageEstimate,
+    addClip,
+    removeClip,
+  } = localClips
 
   const setSyncError = useCallback((message: string) => {
     setSyncState('error')
@@ -258,14 +265,14 @@ function App() {
 
   const touchDevice = useCallback(
     async (role: DeviceRole, online = true) => {
-      if (!activeRoom || !session) {
+      if (!activeRoomId || !session) {
         return
       }
 
       const timestamp = nowIso()
       const device: MotionCueDevice = {
         id: deviceId,
-        roomId: activeRoom.id,
+        roomId: activeRoomId,
         role,
         name: getDeviceName(role),
         userAgent: navigator.userAgent,
@@ -274,9 +281,9 @@ function App() {
         createdAt: timestamp,
         updatedAt: timestamp,
       }
-      await repository.upsertDevice(session.uid, activeRoom.id, device)
+      await repository.upsertDevice(session.uid, activeRoomId, device)
     },
-    [activeRoom, deviceId, repository, session],
+    [activeRoomId, deviceId, repository, session],
   )
 
   const markAlertsRead = useCallback(async () => {
@@ -298,6 +305,45 @@ function App() {
   }, [activeRoom, events, repository, session])
 
   useMotionNotifications(activeRoom, events, view)
+
+  const handleClipSaved = useCallback(
+    (clip: LocalClip) => {
+      void addClip(clip)
+    },
+    [addClip],
+  )
+
+  const handleClipDelete = useCallback(
+    (clipId: string) => {
+      void removeClip(clipId)
+    },
+    [removeClip],
+  )
+
+  const handleSaveEvent = useCallback(
+    (event: MotionCueEvent) => {
+      void saveEvent(event)
+    },
+    [saveEvent],
+  )
+
+  const handleTouchDevice = useCallback(
+    (role: DeviceRole, online?: boolean) => {
+      void touchDevice(role, online)
+    },
+    [touchDevice],
+  )
+
+  const handleSettingsChange = useCallback(
+    (settings: RecorderSettings) => {
+      void updateSettings(settings)
+    },
+    [updateSettings],
+  )
+
+  const handleMarkAlertsRead = useCallback(() => {
+    void markAlertsRead()
+  }, [markAlertsRead])
 
   if (!isReady) {
     return <LoadingScreen label="Opening MotionCue" />
@@ -346,12 +392,12 @@ function App() {
               view={view}
               syncState={syncState}
               syncMessage={syncMessage}
-              clips={localClips.clips}
-              storageEstimate={localClips.estimate}
-              onClipSaved={(clip) => void localClips.addClip(clip)}
-              onClipDelete={(clipId) => void localClips.removeClip(clipId)}
-              onSaveEvent={(event) => void saveEvent(event)}
-              onTouchDevice={(role, online) => void touchDevice(role, online)}
+              clips={clips}
+              storageEstimate={storageEstimate}
+              onClipSaved={handleClipSaved}
+              onClipDelete={handleClipDelete}
+              onSaveEvent={handleSaveEvent}
+              onTouchDevice={handleTouchDevice}
               onViewChange={setView}
               onBack={() => {
                 setSelectedRoomId(null)
@@ -359,8 +405,8 @@ function App() {
                 setView('rooms')
                 replaceUrlState(null, 'rooms')
               }}
-              onSettingsChange={(settings) => void updateSettings(settings)}
-              onMarkAlertsRead={() => void markAlertsRead()}
+              onSettingsChange={handleSettingsChange}
+              onMarkAlertsRead={handleMarkAlertsRead}
             />
           )}
         </div>
