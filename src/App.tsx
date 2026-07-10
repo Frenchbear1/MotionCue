@@ -710,6 +710,7 @@ function Workspace({
                 connections={connections}
                 onClipSaved={onClipSaved}
                 onSaveEvent={onSaveEvent}
+                onTouchDevice={onTouchDevice}
                 onSettingsChange={onSettingsChange}
               />
             ) : null}
@@ -788,6 +789,7 @@ function MonitorPanel({
         : null,
     [connectionId, connections],
   )
+  const monitorButtonLabel = peerRef.current ? 'Retry stream' : 'Start monitor'
 
   useEffect(() => {
     void QRCode.toDataURL(recorderUrl, {
@@ -925,10 +927,12 @@ function MonitorPanel({
       void repository.addCandidate(session.uid, room.id, nextConnectionId, candidate)
     }
 
+    const createdAt = nowIso()
+
     try {
       const offer = await peer.createOffer()
       await peer.setLocalDescription(offer)
-      await repository.createConnection(session.uid, room.id, {
+      const connection: SignalingConnection = {
         id: nextConnectionId,
         roomId: room.id,
         monitorDeviceId: deviceId,
@@ -936,11 +940,21 @@ function MonitorPanel({
         state: 'offer',
         offer: toSignalingDescription(peer.localDescription),
         answer: null,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      })
+        createdAt,
+        updatedAt: createdAt,
+      }
+
       setConnectionId(nextConnectionId)
       setConnectionLabel('Waiting for phone')
+      setIsConnecting(false)
+      void repository
+        .createConnection(session.uid, room.id, connection)
+        .catch((error: unknown) => {
+          if (peerRef.current === peer) {
+            setConnectionLabel(formatUnknownError(error, 'Could not write video signal.'))
+            setIsConnecting(false)
+          }
+        })
     } catch (error) {
       peer.close()
       peerRef.current = null
@@ -1018,7 +1032,7 @@ function MonitorPanel({
               className="pressable flex items-center justify-center gap-2 rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-stone-950 shadow-lg disabled:opacity-60"
             >
               {isConnecting ? <Loader2 className="animate-spin" size={18} /> : <Play size={18} />}
-              Start monitor
+              {isConnecting ? 'Opening' : monitorButtonLabel}
             </button>
             <button
               type="button"
@@ -1107,6 +1121,7 @@ function RecorderPanel({
   connections,
   onClipSaved,
   onSaveEvent,
+  onTouchDevice,
   onSettingsChange,
 }: {
   room: MotionCueRoom
@@ -1116,6 +1131,7 @@ function RecorderPanel({
   connections: SignalingConnection[]
   onClipSaved: (clip: LocalClip) => void
   onSaveEvent: (event: MotionCueEvent) => void
+  onTouchDevice: (role: DeviceRole, online?: boolean) => void
   onSettingsChange: (settings: RecorderSettings) => void
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -1172,6 +1188,7 @@ function RecorderPanel({
       }
 
       setCameraReady(true)
+      onTouchDevice('recorder', true)
       await onSaveEvent(
         buildEvent({
           roomId: room.id,
@@ -1184,9 +1201,20 @@ function RecorderPanel({
     } catch (error) {
       setCameraError(error instanceof Error ? error.message : 'Camera permission failed.')
     }
-  }, [deviceId, onSaveEvent, room.id, settings.facingMode, stopCamera])
+  }, [deviceId, onSaveEvent, onTouchDevice, room.id, settings.facingMode, stopCamera])
 
   useEffect(() => stopCamera, [stopCamera])
+
+  useEffect(() => {
+    if (!cameraReady) {
+      return
+    }
+
+    onTouchDevice('recorder', true)
+    const interval = window.setInterval(() => onTouchDevice('recorder', true), 10000)
+
+    return () => window.clearInterval(interval)
+  }, [cameraReady, onTouchDevice])
 
   useEffect(() => {
     const pending = connections.find(
@@ -2432,7 +2460,7 @@ function getDeviceName(role: DeviceRole) {
 }
 
 function isDeviceOnline(device: MotionCueDevice) {
-  return device.online && Date.now() - new Date(device.lastSeenAt).getTime() < 60000
+  return device.online && Date.now() - new Date(device.lastSeenAt).getTime() < 180000
 }
 
 function latestDeviceText(devices: MotionCueDevice[], role: DeviceRole) {
