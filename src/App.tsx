@@ -17,6 +17,7 @@ import {
   Plus,
   QrCode,
   Radio,
+  RefreshCw,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
@@ -33,11 +34,13 @@ import {
 import QRCode from 'qrcode'
 import clsx from 'clsx'
 import {
+  Component,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ErrorInfo,
   type FormEvent,
   type MutableRefObject,
   type ReactNode,
@@ -232,9 +235,13 @@ function App() {
       setSelectedRoomId(room.id)
       setView('monitor')
       setRoomSnapshot(room)
-      await repository.saveRoom(session.uid, room)
+      try {
+        await repository.saveRoom(session.uid, room)
+      } catch (saveError) {
+        setSyncError(formatUnknownError(saveError, 'Could not save room.'))
+      }
     },
-    [repository, session],
+    [repository, session, setSyncError],
   )
 
   const updateSettings = useCallback(
@@ -246,9 +253,13 @@ function App() {
       const nextSettings = normalizeSettings(settings)
       const updatedAt = nowIso()
       setRoomSnapshot({ ...activeRoom, settings: nextSettings, updatedAt })
-      await repository.saveSettings(session.uid, activeRoom.id, nextSettings, updatedAt)
+      try {
+        await repository.saveSettings(session.uid, activeRoom.id, nextSettings, updatedAt)
+      } catch (saveError) {
+        setSyncError(formatUnknownError(saveError, 'Could not save settings.'))
+      }
     },
-    [activeRoom, repository, session],
+    [activeRoom, repository, session, setSyncError],
   )
 
   const saveEvent = useCallback(
@@ -258,9 +269,13 @@ function App() {
       }
 
       setEvents((current) => [event, ...current.filter((entry) => entry.id !== event.id)])
-      await repository.saveEvent(session.uid, event.roomId, event)
+      try {
+        await repository.saveEvent(session.uid, event.roomId, event)
+      } catch (saveError) {
+        setSyncError(formatUnknownError(saveError, 'Could not save event.'))
+      }
     },
-    [repository, session],
+    [repository, session, setSyncError],
   )
 
   const touchDevice = useCallback(
@@ -281,9 +296,13 @@ function App() {
         createdAt: timestamp,
         updatedAt: timestamp,
       }
-      await repository.upsertDevice(session.uid, activeRoomId, device)
+      try {
+        await repository.upsertDevice(session.uid, activeRoomId, device)
+      } catch (saveError) {
+        setSyncError(formatUnknownError(saveError, 'Could not update device presence.'))
+      }
     },
-    [activeRoomId, deviceId, repository, session],
+    [activeRoomId, deviceId, repository, session, setSyncError],
   )
 
   const markAlertsRead = useCallback(async () => {
@@ -301,8 +320,12 @@ function App() {
     setEvents((current) =>
       current.map((event) => (unreadIds.includes(event.id) ? { ...event, readAt } : event)),
     )
-    await repository.markEventsRead(session.uid, activeRoom.id, unreadIds, readAt)
-  }, [activeRoom, events, repository, session])
+    try {
+      await repository.markEventsRead(session.uid, activeRoom.id, unreadIds, readAt)
+    } catch (saveError) {
+      setSyncError(formatUnknownError(saveError, 'Could not mark alerts read.'))
+    }
+  }, [activeRoom, events, repository, session, setSyncError])
 
   useMotionNotifications(activeRoom, events, view)
 
@@ -380,39 +403,84 @@ function App() {
               onSignOut={() => void signOut()}
             />
           ) : (
-            <Workspace
-              room={activeRoom}
-              rooms={rooms}
-              session={session}
-              repository={repository}
-              deviceId={deviceId}
-              devices={devices}
-              events={events}
-              connections={connections}
-              view={view}
-              syncState={syncState}
-              syncMessage={syncMessage}
-              clips={clips}
-              storageEstimate={storageEstimate}
-              onClipSaved={handleClipSaved}
-              onClipDelete={handleClipDelete}
-              onSaveEvent={handleSaveEvent}
-              onTouchDevice={handleTouchDevice}
-              onViewChange={setView}
-              onBack={() => {
-                setSelectedRoomId(null)
-                setRoomSnapshot(null)
-                setView('rooms')
-                replaceUrlState(null, 'rooms')
-              }}
-              onSettingsChange={handleSettingsChange}
-              onMarkAlertsRead={handleMarkAlertsRead}
-            />
+            <AppErrorBoundary onReset={() => window.location.reload()}>
+              <Workspace
+                room={activeRoom}
+                rooms={rooms}
+                session={session}
+                repository={repository}
+                deviceId={deviceId}
+                devices={devices}
+                events={events}
+                connections={connections}
+                view={view}
+                syncState={syncState}
+                syncMessage={syncMessage}
+                clips={clips}
+                storageEstimate={storageEstimate}
+                onClipSaved={handleClipSaved}
+                onClipDelete={handleClipDelete}
+                onSaveEvent={handleSaveEvent}
+                onTouchDevice={handleTouchDevice}
+                onViewChange={setView}
+                onBack={() => {
+                  setSelectedRoomId(null)
+                  setRoomSnapshot(null)
+                  setView('rooms')
+                  replaceUrlState(null, 'rooms')
+                }}
+                onSettingsChange={handleSettingsChange}
+                onMarkAlertsRead={handleMarkAlertsRead}
+              />
+            </AppErrorBoundary>
           )}
         </div>
       </div>
     </MotionConfig>
   )
+}
+
+class AppErrorBoundary extends Component<
+  { children: ReactNode; onReset: () => void },
+  { message: string }
+> {
+  state = { message: '' }
+
+  static getDerivedStateFromError(error: unknown) {
+    return {
+      message: formatUnknownError(error, 'The room view crashed.'),
+    }
+  }
+
+  componentDidCatch(error: unknown, errorInfo: ErrorInfo) {
+    console.error('MotionCue room error', error, errorInfo)
+  }
+
+  render() {
+    if (this.state.message) {
+      return (
+        <main className="grid min-h-[70svh] place-items-center px-5 py-10">
+          <section className="w-full max-w-[430px] rounded-[28px] border border-white bg-white p-5 text-center shadow-xl">
+            <div className="mx-auto grid size-14 place-items-center rounded-3xl bg-red-50 text-red-700">
+              <WifiOff size={26} />
+            </div>
+            <h1 className="mt-4 text-2xl font-semibold text-stone-950">Room needs a refresh</h1>
+            <p className="mt-2 text-sm leading-6 text-stone-500">{this.state.message}</p>
+            <button
+              type="button"
+              onClick={this.props.onReset}
+              className="pressable mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-stone-950 px-5 py-4 text-sm font-semibold text-white"
+            >
+              <RefreshCw size={17} />
+              Refresh MotionCue
+            </button>
+          </section>
+        </main>
+      )
+    }
+
+    return this.props.children
+  }
 }
 
 function RoomsScreen({
@@ -2290,6 +2358,10 @@ function personStatusText(result: PersonDetectionResult) {
   }
 
   return 'Person filter ready. Motion records when a person is visible.'
+}
+
+function formatUnknownError(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback
 }
 
 function formatDate(value: string) {

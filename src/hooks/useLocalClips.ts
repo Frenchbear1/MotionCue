@@ -12,12 +12,17 @@ export function useLocalClips(roomId: string | null) {
       return
     }
 
-    const [nextClips, nextEstimate] = await Promise.all([
-      listClips(roomId),
-      estimateClipStorage(),
-    ])
-    setClips(nextClips)
-    setEstimate(nextEstimate)
+    try {
+      const [nextClips, nextEstimate] = await Promise.all([
+        listClips(roomId),
+        estimateClipStorage(),
+      ])
+      setClips(nextClips)
+      setEstimate(nextEstimate)
+    } catch {
+      setClips([])
+      setEstimate({ used: 0, quota: 0, percent: 0 })
+    }
   }, [roomId])
 
   useEffect(() => {
