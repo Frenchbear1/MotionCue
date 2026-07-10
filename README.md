@@ -1,51 +1,41 @@
 # MotionCue
 
-MotionCue is a local-first PWA for using a phone as a motion-triggered camera and a laptop as the monitor. It uses Firebase Authentication and Cloud Firestore for account sync, room pairing, presence, WebRTC signaling, settings, and lightweight motion-event metadata.
+MotionCue is now a LAN-first camera monitor. The laptop runs a tiny local HTTPS server, the monitor opens from that server, and the phone joins by scanning the QR code. Firebase is no longer needed for pairing, presence, signaling, settings, or motion events.
 
-Video and motion-triggered clips stay on the recording phone in IndexedDB. The app does not use Firebase Storage, Cloud Functions, or any paid relay service.
+Video streams phone-to-laptop with WebRTC on the local network. Motion-triggered clips stay on the recording phone in IndexedDB with manual export/delete.
 
-## Hosted App
-
-- App: https://frenchbear1.github.io/MotionCue/
-- Repo: https://github.com/Frenchbear1/MotionCue
-
-## Local Development
+## Local Use
 
 ```bash
 npm install
-npm run dev
+npm run local
 ```
 
-The Firebase config is in `.env.local`. Deploy `firestore.rules` to the Firebase project before using a hosted app.
+Keep the terminal window open. It prints:
 
-## Firebase Console Setup
+- `https://localhost:8787/` for the laptop monitor.
+- A Wi-Fi URL like `https://192.168.0.168:8787/` for the phone.
 
-1. In Firebase Authentication, enable Google sign-in and Email/Password sign-in.
-2. In Firebase Authentication settings, add `frenchbear1.github.io` to Authorized domains.
-3. Create a Cloud Firestore database if one does not exist.
-4. Publish the included `firestore.rules` file, or run `firebase deploy --only firestore:rules` after logging in with Firebase CLI.
+Open the laptop URL, scan the QR code with the phone, then tap **Start camera** on the phone.
 
-For GitHub Pages deployment, add these repository secrets before running the included workflow:
+## HTTPS Note
 
-```text
-VITE_FIREBASE_API_KEY
-VITE_FIREBASE_AUTH_DOMAIN
-VITE_FIREBASE_PROJECT_ID
-VITE_FIREBASE_MESSAGING_SENDER_ID
-VITE_FIREBASE_APP_ID
-VITE_FIREBASE_MEASUREMENT_ID
-```
-
-## Notes
-
-- Camera APIs require HTTPS on phones, except for `localhost` during development.
-- Same-Wi-Fi live viewing uses WebRTC with Firestore signaling. It may not connect across some networks without a TURN relay, which is intentionally omitted to avoid recurring charges.
-- Browser notifications are shown only while MotionCue is open and notification permission is granted.
-- Person detection is optional, local, and browser-side via TensorFlow.js/COCO-SSD.
+Phone camera APIs require HTTPS. MotionCue generates a local self-signed certificate in `.local/`. The first phone visit may show a browser privacy warning for the laptop server; continue once, then the camera page can open over HTTPS.
 
 ## Scripts
 
 ```bash
+npm run local
+npm run local:server
 npm run test
 npm run build
 ```
+
+`npm run local` builds and starts the local server. `npm run local:server` starts the server from the existing `dist/` build.
+
+## Notes
+
+- No Firebase Storage, Cloud Functions, Auth, or Firestore is required for the local version.
+- Browser notifications work while the monitor page is open and permission is granted.
+- Person detection is optional, local, and browser-side via TensorFlow.js/COCO-SSD.
+- Live video is intended for devices on the same Wi-Fi/LAN.
