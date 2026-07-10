@@ -10,6 +10,10 @@ export type RecorderSettings = {
   sensitivity: number
   cooldownSeconds: number
   clipSeconds: number
+  loopRecording: boolean
+  preRollSeconds: number
+  postMotionSeconds: number
+  maxClipSeconds: number
   recordOnMotion: boolean
   zones: boolean[]
   facingMode: FacingMode

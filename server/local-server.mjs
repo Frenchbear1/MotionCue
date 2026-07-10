@@ -16,7 +16,9 @@ const localDir = path.join(rootDir, '.local')
 const certPath = path.join(localDir, 'motioncue-cert.pem')
 const keyPath = path.join(localDir, 'motioncue-key.pem')
 const metaPath = path.join(localDir, 'motioncue-cert-meta.json')
-const clipsDir = path.join(localDir, 'clips')
+const clipsDir = process.env.MOTIONCUE_CLIPS_DIR
+  ? path.resolve(process.env.MOTIONCUE_CLIPS_DIR)
+  : path.join(localDir, 'clips')
 const port = Number(process.env.MOTIONCUE_PORT || 8787)
 const host = '0.0.0.0'
 const lanIps = getLanIps()
@@ -30,6 +32,10 @@ const defaultSettings = {
   sensitivity: 58,
   cooldownSeconds: 12,
   clipSeconds: 10,
+  loopRecording: true,
+  preRollSeconds: 30,
+  postMotionSeconds: 8,
+  maxClipSeconds: 300,
   recordOnMotion: true,
   zones: Array.from({ length: 9 }, () => true),
   facingMode: 'environment',
@@ -52,6 +58,7 @@ app.get('/motioncue-server.json', (_request, response) => {
     localUrls,
     lanUrls,
     preferredJoinUrl: lanUrls[0] ?? `https://localhost:${port}/`,
+    clipStoragePath: clipsDir,
   })
 })
 
@@ -200,6 +207,7 @@ wss.on('connection', (socket, request) => {
     localUrls,
     lanUrls,
     preferredJoinUrl: lanUrls[0] ?? `https://localhost:${port}/`,
+    clipStoragePath: clipsDir,
     ...snapshot(room),
   })
   broadcastRoomState(room)
@@ -536,6 +544,15 @@ function normalizeSettings(settings) {
     sensitivity: clamp(settings?.sensitivity, 1, 100, defaultSettings.sensitivity),
     cooldownSeconds: clamp(settings?.cooldownSeconds, 2, 120, defaultSettings.cooldownSeconds),
     clipSeconds: clamp(settings?.clipSeconds, 3, 30, defaultSettings.clipSeconds),
+    loopRecording: Boolean(settings?.loopRecording ?? defaultSettings.loopRecording),
+    preRollSeconds: clamp(settings?.preRollSeconds, 0, 60, defaultSettings.preRollSeconds),
+    postMotionSeconds: clamp(
+      settings?.postMotionSeconds,
+      2,
+      120,
+      defaultSettings.postMotionSeconds,
+    ),
+    maxClipSeconds: clamp(settings?.maxClipSeconds, 30, 600, defaultSettings.maxClipSeconds),
     recordOnMotion: Boolean(settings?.recordOnMotion ?? defaultSettings.recordOnMotion),
     zones,
     facingMode: settings?.facingMode === 'user' ? 'user' : 'environment',

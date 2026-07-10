@@ -64,6 +64,7 @@ type ServerInfo = {
   localUrls: string[]
   lanUrls: string[]
   preferredJoinUrl: string
+  clipStoragePath: string
 }
 
 type ServerClip = {
@@ -79,6 +80,16 @@ type ServerClip = {
   fileName: string
   url: string
   createdAt: string
+}
+
+type RollingChunk = {
+  blob: Blob
+  createdAt: number
+}
+
+type ActiveRecording = {
+  eventId: string
+  startedAtMs: number
 }
 
 type SignalPayload =
@@ -120,6 +131,7 @@ type ServerMessage =
       localUrls?: string[]
       lanUrls?: string[]
       preferredJoinUrl?: string
+      clipStoragePath?: string
     }
   | { type: 'settings'; roomId: string; settings: RecorderSettings }
   | { type: 'event'; roomId: string; event: MotionCueEvent }
@@ -727,6 +739,11 @@ function RecorderPanel({
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([])
   const processedSignalsRef = useRef<Set<string>>(new Set())
   const recordingRef = useRef(false)
+  const rollingRecorderRef = useRef<MediaRecorder | null>(null)
+  const rollingChunksRef = useRef<RollingChunk[]>([])
+  const activeChunksRef = useRef<RollingChunk[]>([])
+  const activeRecordingRef = useRef<ActiveRecording | null>(null)
+  const rollingMimeTypeRef = useRef('video/webm')
   const previousFrameRef = useRef<MotionFrame | null>(null)
   const lastTriggerAtRef = useRef<number | null>(null)
   const motionActiveRef = useRef(false)
@@ -819,9 +836,19 @@ function RecorderPanel({
   )
 
   const stopCamera = useCallback(() => {
+    if (rollingRecorderRef.current?.state === 'recording') {
+      rollingRecorderRef.current.stop()
+    }
+
+    rollingRecorderRef.current = null
+    rollingChunksRef.current = []
+    activeChunksRef.current = []
+    activeRecordingRef.current = null
+    recordingRef.current = false
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     setCameraReady(false)
+    setIsRecording(false)
     closePeer()
 
     if (videoRef.current) {
@@ -902,38 +929,134 @@ function RecorderPanel({
     })
   }, [acceptOffer, addRemoteCandidate, closePeer, signals])
 
-  const recordClip = useCallback(async () => {
-    const stream = streamRef.current
+  const trimRollingChunks = useCallback(() => {
+    const maxBufferMs = Math.max(5000, settings.preRollSeconds * 1000 + 5000)
+    const cutoff = Date.now() - maxBufferMs
+    rollingChunksRef.current = rollingChunksRef.current.filter((chunk) => chunk.createdAt >= cutoff)
+  }, [settings.preRollSeconds])
 
-    if (!stream || recordingRef.current || typeof MediaRecorder === 'undefined') {
+  const finishMotionRecording = useCallback(() => {
+    const activeRecording = activeRecordingRef.current
+
+    if (!activeRecording) {
       return
     }
 
+    const chunks = activeChunksRef.current
+    activeRecordingRef.current = null
+    activeChunksRef.current = []
+    recordingRef.current = false
+    setIsRecording(false)
+
+    if (!chunks.length) {
+      return
+    }
+
+    const endedAt = nowIso()
+    const startedAt = new Date(activeRecording.startedAtMs).toISOString()
+    const blob = new Blob(
+      chunks.map((chunk) => chunk.blob),
+      { type: rollingMimeTypeRef.current || 'video/webm' },
+    )
+    const durationMs = new Date(endedAt).getTime() - activeRecording.startedAtMs
+    const clip: LocalClip = {
+      id: createId('clip'),
+      roomId,
+      eventId: activeRecording.eventId,
+      deviceId,
+      startedAt,
+      endedAt,
+      durationMs,
+      size: blob.size,
+      mimeType: blob.type,
+      blob,
+    }
+
+    onClipSaved(clip)
+    onSaveEvent(
+      buildEvent({
+        roomId,
+        deviceId,
+        type: 'recording_saved',
+        message: 'Clip saved and shared on the laptop.',
+        createdAt: endedAt,
+        clipId: clip.id,
+        durationMs,
+        size: blob.size,
+      }),
+    )
+  }, [deviceId, onClipSaved, onSaveEvent, roomId])
+
+  const beginMotionRecording = useCallback(() => {
+    if (!settings.recordOnMotion || recordingRef.current || typeof MediaRecorder === 'undefined') {
+      return
+    }
+
+    const now = Date.now()
+    const preRollMs = settings.loopRecording ? settings.preRollSeconds * 1000 : 0
+    const bufferedChunks = rollingChunksRef.current.filter((chunk) => now - chunk.createdAt <= preRollMs)
+    const startedAtMs = bufferedChunks[0]?.createdAt ?? now
+    const eventId = createId('evt')
+
+    activeChunksRef.current = [...bufferedChunks]
+    activeRecordingRef.current = { eventId, startedAtMs }
     recordingRef.current = true
     setIsRecording(true)
-    const chunks: Blob[] = []
-    const startedAt = nowIso()
-    const eventId = createId('evt')
-    const mimeType = chooseRecordingMimeType()
-    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
 
     onSaveEvent({
       id: eventId,
       roomId,
       type: 'recording_started',
       deviceId,
-      message: 'Motion recording started.',
-      createdAt: startedAt,
+      message: settings.loopRecording
+        ? `Motion recording started with ${settings.preRollSeconds}s pre-roll.`
+        : 'Motion recording started.',
+      createdAt: new Date(startedAtMs).toISOString(),
       readAt: null,
       score: null,
       clipId: null,
       durationMs: null,
       size: null,
     })
+  }, [
+    deviceId,
+    onSaveEvent,
+    roomId,
+    settings.loopRecording,
+    settings.preRollSeconds,
+    settings.recordOnMotion,
+  ])
 
+  useEffect(() => {
+    const stream = streamRef.current
+
+    if (
+      !cameraReady ||
+      !settings.recordOnMotion ||
+      !stream ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      return
+    }
+
+    const mimeType = chooseRecordingMimeType()
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+    rollingMimeTypeRef.current = recorder.mimeType || mimeType || 'video/webm'
+    rollingRecorderRef.current = recorder
     recorder.ondataavailable = (event) => {
-      if (event.data.size) {
-        chunks.push(event.data)
+      if (!event.data.size) {
+        return
+      }
+
+      const chunk: RollingChunk = {
+        blob: event.data,
+        createdAt: Date.now(),
+      }
+      rollingChunksRef.current.push(chunk)
+      trimRollingChunks()
+
+      if (recordingRef.current) {
+        activeChunksRef.current.push(chunk)
       }
     }
     recorder.onerror = () => {
@@ -942,51 +1065,41 @@ function RecorderPanel({
           roomId,
           deviceId,
           type: 'recording_failed',
-          message: 'Recording failed on this device.',
+          message: 'Loop recording failed on this device.',
           createdAt: nowIso(),
         }),
       )
     }
-    recorder.onstop = () => {
-      const endedAt = nowIso()
-      const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' })
-      const durationMs = new Date(endedAt).getTime() - new Date(startedAt).getTime()
-      const clip: LocalClip = {
-        id: createId('clip'),
-        roomId,
-        eventId,
-        deviceId,
-        startedAt,
-        endedAt,
-        durationMs,
-        size: blob.size,
-        mimeType: blob.type,
-        blob,
-      }
-      onClipSaved(clip)
-      onSaveEvent(
-        buildEvent({
-          roomId,
-          deviceId,
-          type: 'recording_saved',
-          message: 'Clip saved on the phone.',
-          createdAt: endedAt,
-          clipId: clip.id,
-          durationMs,
-          size: blob.size,
-        }),
-      )
-      recordingRef.current = false
-      setIsRecording(false)
-    }
+    recorder.start(1000)
 
-    recorder.start(250)
-    window.setTimeout(() => {
+    return () => {
+      if (recordingRef.current) {
+        finishMotionRecording()
+      }
+
       if (recorder.state !== 'inactive') {
         recorder.stop()
       }
-    }, settings.clipSeconds * 1000)
-  }, [deviceId, onClipSaved, onSaveEvent, roomId, settings.clipSeconds])
+
+      if (rollingRecorderRef.current === recorder) {
+        rollingRecorderRef.current = null
+      }
+    }
+  }, [
+    cameraReady,
+    deviceId,
+    finishMotionRecording,
+    onSaveEvent,
+    roomId,
+    settings.recordOnMotion,
+    trimRollingChunks,
+  ])
+
+  useEffect(() => {
+    if (!settings.armed && recordingRef.current) {
+      finishMotionRecording()
+    }
+  }, [finishMotionRecording, settings.armed])
 
   useEffect(() => {
     if (!cameraReady || !settings.armed || !videoRef.current || !canvasRef.current) {
@@ -1035,10 +1148,22 @@ function RecorderPanel({
       }
 
       const now = Date.now()
-      if (nextAnalysis.motion) {
+      if (nextAnalysis.motion && allowedByPersonFilter) {
         lastMotionSeenAtRef.current = now
       } else if (now - lastMotionSeenAtRef.current > MOTION_CLEAR_MS) {
         motionActiveRef.current = false
+      }
+
+      if (recordingRef.current && activeRecordingRef.current) {
+        const recordingDurationMs = now - activeRecordingRef.current.startedAtMs
+        const quietForMs = now - lastMotionSeenAtRef.current
+
+        if (
+          recordingDurationMs >= settings.maxClipSeconds * 1000 ||
+          quietForMs >= settings.postMotionSeconds * 1000
+        ) {
+          finishMotionRecording()
+        }
       }
 
       if (
@@ -1068,7 +1193,7 @@ function RecorderPanel({
         )
 
         if (settings.recordOnMotion) {
-          void recordClip()
+          beginMotionRecording()
         }
       }
 
@@ -1081,7 +1206,15 @@ function RecorderPanel({
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [cameraReady, deviceId, onSaveEvent, recordClip, roomId, settings])
+  }, [
+    beginMotionRecording,
+    cameraReady,
+    deviceId,
+    finishMotionRecording,
+    onSaveEvent,
+    roomId,
+    settings,
+  ])
 
   return (
     <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]">
@@ -1225,20 +1358,41 @@ function RecorderControls({
           suffix="s"
           onChange={(value) => onChange({ cooldownSeconds: value })}
         />
-        <RangeControl
-          label="Clip length"
-          value={settings.clipSeconds}
-          min={3}
-          max={30}
-          suffix="s"
-          onChange={(value) => onChange({ clipSeconds: value })}
-        />
-
         <ToggleRow
           title="Record on motion"
           body="Save clips to this phone and the laptop server."
           checked={settings.recordOnMotion}
           onChange={(checked) => onChange({ recordOnMotion: checked })}
+        />
+        <ToggleRow
+          title="Loop pre-roll"
+          body="Keep a rolling buffer so clips can include time before motion."
+          checked={settings.loopRecording}
+          onChange={(checked) => onChange({ loopRecording: checked })}
+        />
+        <RangeControl
+          label="Pre-roll"
+          value={settings.preRollSeconds}
+          min={0}
+          max={60}
+          suffix="s"
+          onChange={(value) => onChange({ preRollSeconds: value })}
+        />
+        <RangeControl
+          label="After motion"
+          value={settings.postMotionSeconds}
+          min={2}
+          max={120}
+          suffix="s"
+          onChange={(value) => onChange({ postMotionSeconds: value })}
+        />
+        <RangeControl
+          label="Max clip"
+          value={settings.maxClipSeconds}
+          min={30}
+          max={600}
+          suffix="s"
+          onChange={(value) => onChange({ maxClipSeconds: value })}
         />
 
         <SegmentedControl
@@ -1296,13 +1450,13 @@ function ClipsPanel({
           />
         </div>
         <div className="mt-4 grid grid-cols-2 gap-3">
-          <Metric label="Used" value={formatBytes(storageEstimate.used)} />
-          <Metric label="Quota" value={storageEstimate.quota ? formatBytes(storageEstimate.quota) : 'Unknown'} />
+          <Metric label="Phone used" value={formatBytes(storageEstimate.used)} />
+          <Metric label="Phone limit" value={storageEstimate.quota ? formatBytes(storageEstimate.quota) : 'Unknown'} />
         </div>
         <div className="mt-4 grid grid-cols-2 gap-3">
-          <Metric label="Shared" value={`${serverClips.length}`} />
+          <Metric label="Shared clips" value={`${serverClips.length}`} />
           <Metric
-            label="Laptop"
+            label="Laptop used"
             value={formatBytes(serverClips.reduce((total, clip) => total + clip.size, 0))}
           />
         </div>
@@ -1368,6 +1522,8 @@ function SettingsPanel({
   onSettingsChange: (settings: RecorderSettings) => void
 }) {
   const [copied, setCopied] = useState(false)
+  const [copiedStorage, setCopiedStorage] = useState(false)
+  const clipStoragePath = serverInfo?.clipStoragePath ?? 'Starting server...'
   const submitRoom = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
   }
@@ -1376,6 +1532,12 @@ function SettingsPanel({
     await navigator.clipboard.writeText(recorderUrl)
     setCopied(true)
     window.setTimeout(() => setCopied(false), 1200)
+  }
+
+  const copyStoragePath = async () => {
+    await navigator.clipboard.writeText(clipStoragePath)
+    setCopiedStorage(true)
+    window.setTimeout(() => setCopiedStorage(false), 1200)
   }
 
   return (
@@ -1400,6 +1562,14 @@ function SettingsPanel({
               onSettingsChange(normalizeSettings({ ...settings, recordOnMotion }))
             }
           />
+          <ToggleRow
+            title="Loop pre-roll"
+            body="Include buffered video from before motion starts."
+            checked={settings.loopRecording}
+            onChange={(loopRecording) =>
+              onSettingsChange(normalizeSettings({ ...settings, loopRecording }))
+            }
+          />
           <RangeControl
             label="Sensitivity"
             value={settings.sensitivity}
@@ -1408,6 +1578,36 @@ function SettingsPanel({
             suffix="%"
             onChange={(sensitivity) =>
               onSettingsChange(normalizeSettings({ ...settings, sensitivity }))
+            }
+          />
+          <RangeControl
+            label="Pre-roll"
+            value={settings.preRollSeconds}
+            min={0}
+            max={60}
+            suffix="s"
+            onChange={(preRollSeconds) =>
+              onSettingsChange(normalizeSettings({ ...settings, preRollSeconds }))
+            }
+          />
+          <RangeControl
+            label="After motion"
+            value={settings.postMotionSeconds}
+            min={2}
+            max={120}
+            suffix="s"
+            onChange={(postMotionSeconds) =>
+              onSettingsChange(normalizeSettings({ ...settings, postMotionSeconds }))
+            }
+          />
+          <RangeControl
+            label="Max clip"
+            value={settings.maxClipSeconds}
+            min={30}
+            max={600}
+            suffix="s"
+            onChange={(maxClipSeconds) =>
+              onSettingsChange(normalizeSettings({ ...settings, maxClipSeconds }))
             }
           />
         </div>
@@ -1433,6 +1633,23 @@ function SettingsPanel({
           </button>
         </form>
         <div className="mt-4 space-y-2">
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-stone-400">
+            Clip folder
+          </p>
+          <input
+            className={inputClass}
+            value={clipStoragePath}
+            readOnly
+            aria-label="Clip storage folder"
+          />
+          <button
+            type="button"
+            onClick={() => void copyStoragePath()}
+            className="pressable flex w-full items-center justify-center gap-2 rounded-2xl bg-stone-100 px-5 py-3 text-sm font-semibold text-stone-700"
+          >
+            <Copy size={17} />
+            {copiedStorage ? 'Copied' : 'Copy folder'}
+          </button>
           {(serverInfo?.lanUrls ?? []).map((url) => (
             <p key={url} className="truncate rounded-2xl bg-stone-100 px-4 py-3 text-sm font-semibold text-stone-600">
               {url}
@@ -1569,6 +1786,7 @@ function useLocalSocket({
               preferredJoinUrl: message.preferredJoinUrl ?? window.location.origin,
               lanUrls: message.lanUrls ?? [],
               localUrls: message.localUrls ?? [window.location.origin],
+              clipStoragePath: message.clipStoragePath ?? '',
             }
             setServerInfo((current) =>
               serverInfoMatches(current, nextServerInfo) ? current : nextServerInfo,
@@ -1888,6 +2106,15 @@ function BottomNav({
 }
 
 function ServerRequiredScreen() {
+  const [copied, setCopied] = useState(false)
+  const startCommands = 'cd /d "C:\\Users\\labar\\Downloads\\Codex Only\\MotionCue"\nnpm run local'
+
+  const copyCommands = async () => {
+    await navigator.clipboard.writeText(startCommands)
+    setCopied(true)
+    window.setTimeout(() => setCopied(false), 1200)
+  }
+
   return (
     <main className="motioncue-shell grid min-h-svh place-items-center px-5 py-10 text-stone-950">
       <section className="w-full max-w-[430px] rounded-[28px] border border-white bg-white p-5 shadow-xl">
@@ -1898,9 +2125,17 @@ function ServerRequiredScreen() {
         <p className="mt-2 text-sm leading-6 text-stone-500">
           Run the local server on the laptop, then open the laptop URL it prints.
         </p>
-        <code className="mt-4 block rounded-2xl bg-stone-950 px-4 py-3 text-sm font-semibold text-white">
-          npm run local
-        </code>
+        <pre className="mt-4 overflow-x-auto rounded-2xl bg-stone-950 px-4 py-3 text-sm font-semibold text-white">
+          <code>{startCommands}</code>
+        </pre>
+        <button
+          type="button"
+          onClick={() => void copyCommands()}
+          className="pressable mt-3 flex w-full items-center justify-center gap-2 rounded-2xl bg-[var(--accent)] px-5 py-3 text-sm font-semibold text-white"
+        >
+          <Copy size={17} />
+          {copied ? 'Copied' : 'Copy cmd lines'}
+        </button>
       </section>
     </main>
   )
@@ -2249,6 +2484,7 @@ function serverInfoMatches(left: ServerInfo | null, right: ServerInfo) {
 
   return (
     left.preferredJoinUrl === right.preferredJoinUrl &&
+    left.clipStoragePath === right.clipStoragePath &&
     left.lanUrls.join('|') === right.lanUrls.join('|') &&
     left.localUrls.join('|') === right.localUrls.join('|')
   )

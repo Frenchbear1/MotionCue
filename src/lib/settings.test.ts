@@ -11,11 +11,17 @@ describe('normalizeSettings', () => {
       sensitivity: 999,
       cooldownSeconds: -1,
       clipSeconds: 100,
+      preRollSeconds: 999,
+      postMotionSeconds: -1,
+      maxClipSeconds: 9999,
     })
 
     expect(settings.sensitivity).toBe(100)
     expect(settings.cooldownSeconds).toBe(2)
     expect(settings.clipSeconds).toBe(30)
+    expect(settings.preRollSeconds).toBe(60)
+    expect(settings.postMotionSeconds).toBe(2)
+    expect(settings.maxClipSeconds).toBe(600)
   })
 
   it('keeps only complete zone maps', () => {

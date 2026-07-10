@@ -2,7 +2,7 @@
 
 MotionCue is now a LAN-first camera monitor. The laptop runs a tiny local HTTPS server, the monitor opens from that server, and the phone joins by scanning the QR code. Firebase is no longer needed for pairing, presence, signaling, settings, or motion events.
 
-Video streams phone-to-laptop with WebRTC on the local network. Motion-triggered clips are saved on the recorder phone and uploaded to the laptop server so connected devices can view them in the Clips tab.
+Video streams phone-to-laptop with WebRTC on the local network. Motion-triggered clips are saved on the recorder phone and uploaded to the laptop server so connected devices can view them in the Clips tab. The recorder can keep a rolling pre-motion buffer, so clips can include time before motion was detected.
 
 ## Local Use
 
@@ -25,6 +25,8 @@ Phone camera APIs require HTTPS. MotionCue generates a local self-signed certifi
 ## Clip Storage
 
 Shared clips are stored on the laptop under `.local/clips/`. They do not use Firebase or cloud storage, so there is no cloud quota or storage bill. They do use laptop disk space, and MotionCue does not auto-delete them; delete clips from the Clips tab when you no longer need them.
+
+To use a different storage folder, start the server with `MOTIONCUE_CLIPS_DIR` set to the folder you want before running `npm run local`.
 
 ## Scripts
 
