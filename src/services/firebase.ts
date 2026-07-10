@@ -53,6 +53,7 @@ export function getFirebaseServices() {
     const app = getApps()[0] ?? initializeApp(firebaseConfig)
     const auth = getAuth(app)
     const db = initializeFirestore(app, {
+      experimentalAutoDetectLongPolling: true,
       localCache: persistentLocalCache({
         tabManager: persistentMultipleTabManager(),
       }),

@@ -22,6 +22,10 @@ import type {
 import { normalizeSettings } from '../lib/settings'
 import { getFirebaseServices } from './firebase'
 
+const FIRESTORE_QUOTA_PAUSE_MS = 5 * 60000
+
+let firestoreWritesPausedUntil = 0
+
 export type MotionCueRepository = {
   subscribeRooms: (
     uid: string,
@@ -107,13 +111,30 @@ export function createMotionCueRepository(): MotionCueRepository {
 }
 
 function createFirestoreRepository(db: Firestore): MotionCueRepository {
+  const write = async (operation: () => Promise<void>) => {
+    if (Date.now() < firestoreWritesPausedUntil) {
+      throw new Error(firestoreQuotaMessage())
+    }
+
+    try {
+      await operation()
+    } catch (error) {
+      if (isQuotaError(error)) {
+        firestoreWritesPausedUntil = Date.now() + FIRESTORE_QUOTA_PAUSE_MS
+        throw new Error(firestoreQuotaMessage())
+      }
+
+      throw error
+    }
+  }
+
   return {
     subscribeRooms(uid, onData, onError) {
       return onSnapshot(
         query(collection(db, `users/${uid}/rooms`), orderBy('updatedAt', 'desc')),
         (snapshot) =>
           onData(snapshot.docs.map((entry) => normalizeRoom(entry.data() as MotionCueRoom))),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeRoom(uid, roomId, onData, onError) {
@@ -121,14 +142,14 @@ function createFirestoreRepository(db: Firestore): MotionCueRepository {
         doc(db, `users/${uid}/rooms/${roomId}`),
         (snapshot) =>
           onData(snapshot.exists() ? normalizeRoom(snapshot.data() as MotionCueRoom) : null),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeDevices(uid, roomId, onData, onError) {
       return onSnapshot(
         collection(db, `users/${uid}/rooms/${roomId}/devices`),
         (snapshot) => onData(snapshot.docs.map((entry) => entry.data() as MotionCueDevice)),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeEvents(uid, roomId, onData, onError) {
@@ -139,7 +160,7 @@ function createFirestoreRepository(db: Firestore): MotionCueRepository {
           firestoreLimit(80),
         ),
         (snapshot) => onData(snapshot.docs.map((entry) => entry.data() as MotionCueEvent)),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeConnections(uid, roomId, onData, onError) {
@@ -150,7 +171,7 @@ function createFirestoreRepository(db: Firestore): MotionCueRepository {
           firestoreLimit(12),
         ),
         (snapshot) => onData(snapshot.docs.map((entry) => entry.data() as SignalingConnection)),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeConnection(uid, roomId, connectionId, onData, onError) {
@@ -158,59 +179,73 @@ function createFirestoreRepository(db: Firestore): MotionCueRepository {
         doc(db, `users/${uid}/rooms/${roomId}/connections/${connectionId}`),
         (snapshot) =>
           onData(snapshot.exists() ? (snapshot.data() as SignalingConnection) : null),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     subscribeCandidates(uid, roomId, connectionId, onData, onError) {
       return onSnapshot(
         collection(db, `users/${uid}/rooms/${roomId}/connections/${connectionId}/candidates`),
         (snapshot) => onData(snapshot.docs.map((entry) => entry.data() as IceCandidateDoc)),
-        (error) => onError(error.message),
+        (error) => onError(formatFirestoreError(error)),
       )
     },
     async saveRoom(uid, room) {
-      await setDoc(doc(db, `users/${uid}/rooms/${room.id}`), normalizeRoom(room))
+      await write(() => setDoc(doc(db, `users/${uid}/rooms/${room.id}`), normalizeRoom(room)))
     },
     async saveSettings(uid, roomId, settings, updatedAt) {
-      await updateDoc(doc(db, `users/${uid}/rooms/${roomId}`), {
-        settings: normalizeSettings(settings),
-        updatedAt,
-      })
-    },
-    async deleteRoom(uid, roomId) {
-      await deleteDoc(doc(db, `users/${uid}/rooms/${roomId}`))
-    },
-    async upsertDevice(uid, roomId, device) {
-      await setDoc(doc(db, `users/${uid}/rooms/${roomId}/devices/${device.id}`), device)
-    },
-    async saveEvent(uid, roomId, event) {
-      await setDoc(doc(db, `users/${uid}/rooms/${roomId}/events/${event.id}`), event)
-    },
-    async markEventsRead(uid, roomId, eventIds, readAt) {
-      await Promise.all(
-        eventIds.map((eventId) =>
-          updateDoc(doc(db, `users/${uid}/rooms/${roomId}/events/${eventId}`), {
-            readAt,
-          }),
-        ),
+      await write(() =>
+        updateDoc(doc(db, `users/${uid}/rooms/${roomId}`), {
+          settings: normalizeSettings(settings),
+          updatedAt,
+        }),
       )
     },
+    async deleteRoom(uid, roomId) {
+      await write(() => deleteDoc(doc(db, `users/${uid}/rooms/${roomId}`)))
+    },
+    async upsertDevice(uid, roomId, device) {
+      await write(() =>
+        setDoc(doc(db, `users/${uid}/rooms/${roomId}/devices/${device.id}`), device, {
+          merge: true,
+        }),
+      )
+    },
+    async saveEvent(uid, roomId, event) {
+      await write(() => setDoc(doc(db, `users/${uid}/rooms/${roomId}/events/${event.id}`), event))
+    },
+    async markEventsRead(uid, roomId, eventIds, readAt) {
+      await write(async () => {
+        await Promise.all(
+          eventIds.map((eventId) =>
+            updateDoc(doc(db, `users/${uid}/rooms/${roomId}/events/${eventId}`), {
+              readAt,
+            }),
+          ),
+        )
+      })
+    },
     async createConnection(uid, roomId, connection) {
-      await setDoc(
-        doc(db, `users/${uid}/rooms/${roomId}/connections/${connection.id}`),
-        connection,
+      await write(() =>
+        setDoc(
+          doc(db, `users/${uid}/rooms/${roomId}/connections/${connection.id}`),
+          connection,
+        ),
       )
     },
     async updateConnection(uid, roomId, connectionId, patch) {
-      await updateDoc(doc(db, `users/${uid}/rooms/${roomId}/connections/${connectionId}`), patch)
+      await write(() =>
+        updateDoc(doc(db, `users/${uid}/rooms/${roomId}/connections/${connectionId}`), patch),
+      )
     },
     async addCandidate(uid, roomId, connectionId, candidate) {
-      await setDoc(
-        doc(
-          db,
-          `users/${uid}/rooms/${roomId}/connections/${connectionId}/candidates/${candidate.id}`,
+      await write(() =>
+        setDoc(
+          doc(
+            db,
+            `users/${uid}/rooms/${roomId}/connections/${connectionId}/candidates/${candidate.id}`,
+          ),
+          candidate,
         ),
-        candidate,
       )
     },
   }
@@ -366,4 +401,30 @@ function sortByCreated<T extends { createdAt: string }>(entries: T[]) {
   return [...entries].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   )
+}
+
+function formatFirestoreError(error: unknown) {
+  return isQuotaError(error) ? firestoreQuotaMessage() : errorMessage(error)
+}
+
+function firestoreQuotaMessage() {
+  return 'Firestore quota is exhausted, so MotionCue cloud sync is paused until Firebase allows writes again.'
+}
+
+function isQuotaError(error: unknown) {
+  const message = errorMessage(error)
+  const code =
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+      ? error.code
+      : ''
+  const normalized = `${code} ${message}`.toLowerCase()
+
+  return normalized.includes('resource-exhausted') || normalized.includes('quota')
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }

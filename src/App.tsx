@@ -102,6 +102,13 @@ const idlePersonResult: PersonDetectionResult = {
   status: 'idle',
 }
 
+const PRESENCE_HEARTBEAT_MS = 60000
+const PRESENCE_OFFLINE_DEBOUNCE_MS = 15000
+const ONLINE_GRACE_MS = 5 * 60000
+const MOTION_CLEAR_MS = 2500
+const SETTINGS_SAVE_DEBOUNCE_MS = 550
+const MAX_ICE_CANDIDATES_PER_SIDE = 10
+
 function App() {
   const {
     session,
@@ -115,6 +122,8 @@ function App() {
   } = useAuthSession()
   const repository = useMemo(() => createMotionCueRepository(), [])
   const deviceId = useDeviceId()
+  const presenceWriteRef = useRef<Record<string, { writtenAt: number; online: boolean }>>({})
+  const settingsSaveTimerRef = useRef<number | null>(null)
   const urlState = useMemo(() => getUrlState(), [])
   const [rooms, setRooms] = useState<MotionCueRoom[]>([])
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(urlState.roomId)
@@ -251,13 +260,25 @@ function App() {
       }
 
       const nextSettings = normalizeSettings(settings)
+      if (settingsSignature(nextSettings) === settingsSignature(activeRoom.settings)) {
+        return
+      }
+
       const updatedAt = nowIso()
       setRoomSnapshot({ ...activeRoom, settings: nextSettings, updatedAt })
-      try {
-        await repository.saveSettings(session.uid, activeRoom.id, nextSettings, updatedAt)
-      } catch (saveError) {
-        setSyncError(formatUnknownError(saveError, 'Could not save settings.'))
+
+      if (settingsSaveTimerRef.current) {
+        window.clearTimeout(settingsSaveTimerRef.current)
       }
+
+      settingsSaveTimerRef.current = window.setTimeout(() => {
+        settingsSaveTimerRef.current = null
+        void repository
+          .saveSettings(session.uid, activeRoom.id, nextSettings, updatedAt)
+          .catch((saveError: unknown) => {
+            setSyncError(formatUnknownError(saveError, 'Could not save settings.'))
+          })
+      }, SETTINGS_SAVE_DEBOUNCE_MS)
     },
     [activeRoom, repository, session, setSyncError],
   )
@@ -284,7 +305,22 @@ function App() {
         return
       }
 
-      const timestamp = nowIso()
+      const now = Date.now()
+      const presenceKey = `${activeRoomId}:${deviceId}:${role}`
+      const previousWrite = presenceWriteRef.current[presenceKey]
+      const minimumGap = online ? PRESENCE_HEARTBEAT_MS : PRESENCE_OFFLINE_DEBOUNCE_MS
+
+      if (
+        previousWrite &&
+        previousWrite.online === online &&
+        now - previousWrite.writtenAt < minimumGap
+      ) {
+        return
+      }
+
+      presenceWriteRef.current[presenceKey] = { writtenAt: now, online }
+
+      const timestamp = new Date(now).toISOString()
       const device: MotionCueDevice = {
         id: deviceId,
         roomId: activeRoomId,
@@ -651,7 +687,7 @@ function Workspace({
 
     const role: DeviceRole = view
     onTouchDevice(role, true)
-    const interval = window.setInterval(() => onTouchDevice(role, true), 25000)
+    const interval = window.setInterval(() => onTouchDevice(role, true), PRESENCE_HEARTBEAT_MS)
 
     return () => {
       window.clearInterval(interval)
@@ -771,6 +807,9 @@ function MonitorPanel({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
   const peerRef = useRef<RTCPeerConnection | null>(null)
   const seenCandidateIdsRef = useRef<Set<string>>(new Set())
+  const pendingRemoteCandidatesRef = useRef<IceCandidateDoc[]>([])
+  const sentCandidateCountRef = useRef(0)
+  const lastConnectionStateWriteRef = useRef('')
   const [connectionId, setConnectionId] = useState<string | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
   const [connectionLabel, setConnectionLabel] = useState('Not connected')
@@ -790,6 +829,32 @@ function MonitorPanel({
     [connectionId, connections],
   )
   const monitorButtonLabel = peerRef.current ? 'Retry stream' : 'Start monitor'
+
+  const addRemoteCandidate = useCallback((candidate: IceCandidateDoc) => {
+    const peer = peerRef.current
+
+    if (!peer || seenCandidateIdsRef.current.has(candidate.id)) {
+      return
+    }
+
+    if (!peer.currentRemoteDescription) {
+      if (!pendingRemoteCandidatesRef.current.some((entry) => entry.id === candidate.id)) {
+        pendingRemoteCandidatesRef.current.push(candidate)
+      }
+      return
+    }
+
+    seenCandidateIdsRef.current.add(candidate.id)
+    void peer.addIceCandidate(candidate.candidate).catch((error: unknown) => {
+      setConnectionLabel(formatUnknownError(error, 'Could not add video candidate.'))
+    })
+  }, [])
+
+  const flushRemoteCandidates = useCallback(() => {
+    const pendingCandidates = pendingRemoteCandidatesRef.current
+    pendingRemoteCandidatesRef.current = []
+    pendingCandidates.forEach(addRemoteCandidate)
+  }, [addRemoteCandidate])
 
   useEffect(() => {
     void QRCode.toDataURL(recorderUrl, {
@@ -819,6 +884,7 @@ function MonitorPanel({
             .then(() => {
               setConnectionLabel('Receiving video')
               setIsConnecting(false)
+              flushRemoteCandidates()
             })
             .catch((error: unknown) => {
               setConnectionLabel(formatUnknownError(error, 'Could not receive video.'))
@@ -837,8 +903,7 @@ function MonitorPanel({
           .filter((candidate) => candidate.fromDeviceId !== deviceId)
           .filter((candidate) => !seenCandidateIdsRef.current.has(candidate.id))
           .forEach((candidate) => {
-            seenCandidateIdsRef.current.add(candidate.id)
-            void peerRef.current?.addIceCandidate(candidate.candidate)
+            addRemoteCandidate(candidate)
           })
       },
       setConnectionLabel,
@@ -848,11 +913,14 @@ function MonitorPanel({
       unsubscribeConnection()
       unsubscribeCandidates()
     }
-  }, [connectionId, deviceId, repository, room.id, session.uid])
+  }, [addRemoteCandidate, connectionId, deviceId, flushRemoteCandidates, repository, room.id, session.uid])
 
   const stopMonitor = useCallback(() => {
     peerRef.current?.close()
     peerRef.current = null
+    pendingRemoteCandidatesRef.current = []
+    sentCandidateCountRef.current = 0
+    lastConnectionStateWriteRef.current = ''
 
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = null
@@ -862,6 +930,8 @@ function MonitorPanel({
       void repository.updateConnection(session.uid, room.id, connectionId, {
         state: 'closed',
         updatedAt: nowIso(),
+      }).catch((error: unknown) => {
+        setConnectionLabel(formatUnknownError(error, 'Could not close monitor signal.'))
       })
     }
 
@@ -878,6 +948,9 @@ function MonitorPanel({
     setIsConnecting(true)
     setConnectionLabel('Opening monitor')
     seenCandidateIdsRef.current = new Set()
+    pendingRemoteCandidatesRef.current = []
+    sentCandidateCountRef.current = 0
+    lastConnectionStateWriteRef.current = ''
 
     const nextConnectionId = createId('conn')
     const peer = createPeerConnection()
@@ -894,18 +967,28 @@ function MonitorPanel({
       setConnectionLabel(peer.iceConnectionState)
       if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
         setIsConnecting(false)
-        void repository.updateConnection(session.uid, room.id, nextConnectionId, {
-          state: 'connected',
-          updatedAt: nowIso(),
-        })
+        if (lastConnectionStateWriteRef.current !== 'connected') {
+          lastConnectionStateWriteRef.current = 'connected'
+          void repository.updateConnection(session.uid, room.id, nextConnectionId, {
+            state: 'connected',
+            updatedAt: nowIso(),
+          }).catch((error: unknown) => {
+            setConnectionLabel(formatUnknownError(error, 'Could not update video signal.'))
+          })
+        }
       }
 
       if (peer.iceConnectionState === 'failed') {
         setIsConnecting(false)
-        void repository.updateConnection(session.uid, room.id, nextConnectionId, {
-          state: 'failed',
-          updatedAt: nowIso(),
-        })
+        if (lastConnectionStateWriteRef.current !== 'failed') {
+          lastConnectionStateWriteRef.current = 'failed'
+          void repository.updateConnection(session.uid, room.id, nextConnectionId, {
+            state: 'failed',
+            updatedAt: nowIso(),
+          }).catch((error: unknown) => {
+            setConnectionLabel(formatUnknownError(error, 'Could not update video signal.'))
+          })
+        }
       }
 
       if (peer.iceConnectionState === 'disconnected') {
@@ -917,6 +1000,11 @@ function MonitorPanel({
         return
       }
 
+      if (sentCandidateCountRef.current >= MAX_ICE_CANDIDATES_PER_SIDE) {
+        return
+      }
+
+      sentCandidateCountRef.current += 1
       const candidate: IceCandidateDoc = {
         id: createId('ice'),
         connectionId: nextConnectionId,
@@ -924,7 +1012,9 @@ function MonitorPanel({
         candidate: event.candidate.toJSON(),
         createdAt: nowIso(),
       }
-      void repository.addCandidate(session.uid, room.id, nextConnectionId, candidate)
+      void repository.addCandidate(session.uid, room.id, nextConnectionId, candidate).catch((error: unknown) => {
+        setConnectionLabel(formatUnknownError(error, 'Could not write video candidate.'))
+      })
     }
 
     const createdAt = nowIso()
@@ -1141,6 +1231,8 @@ function RecorderPanel({
   const recordingRef = useRef(false)
   const previousFrameRef = useRef<MotionFrame | null>(null)
   const lastTriggerAtRef = useRef<number | null>(null)
+  const motionActiveRef = useRef(false)
+  const lastMotionSeenAtRef = useRef(0)
   const lastPersonCheckAtRef = useRef(0)
   const lastPersonResultRef = useRef<PersonDetectionResult>(idlePersonResult)
   const seenCandidateIdsRef = useRef<Set<string>>(new Set())
@@ -1206,17 +1298,6 @@ function RecorderPanel({
   useEffect(() => stopCamera, [stopCamera])
 
   useEffect(() => {
-    if (!cameraReady) {
-      return
-    }
-
-    onTouchDevice('recorder', true)
-    const interval = window.setInterval(() => onTouchDevice('recorder', true), 10000)
-
-    return () => window.clearInterval(interval)
-  }, [cameraReady, onTouchDevice])
-
-  useEffect(() => {
     const pending = connections.find(
       (connection) =>
         connection.state === 'offer' &&
@@ -1246,9 +1327,13 @@ function RecorderPanel({
       peerRef: recorderPeerRef,
       seenCandidateIdsRef,
       setRecorderConnectionId,
-    }).finally(() => {
-      acceptingConnectionRef.current = false
     })
+      .catch((error: unknown) => {
+        setCameraError(formatUnknownError(error, 'Could not connect monitor.'))
+      })
+      .finally(() => {
+        acceptingConnectionRef.current = false
+      })
   }, [
     cameraReady,
     connections,
@@ -1273,8 +1358,16 @@ function RecorderPanel({
           .filter((candidate) => candidate.fromDeviceId !== deviceId)
           .filter((candidate) => !seenCandidateIdsRef.current.has(candidate.id))
           .forEach((candidate) => {
+            const peer = recorderPeerRef.current
+
+            if (!peer) {
+              return
+            }
+
             seenCandidateIdsRef.current.add(candidate.id)
-            void recorderPeerRef.current?.addIceCandidate(candidate.candidate)
+            void peer.addIceCandidate(candidate.candidate).catch((error: unknown) => {
+              setCameraError(formatUnknownError(error, 'Could not add monitor candidate.'))
+            })
           })
       },
       setCameraError,
@@ -1414,7 +1507,14 @@ function RecorderPanel({
       }
 
       const now = Date.now()
+      if (nextAnalysis.motion) {
+        lastMotionSeenAtRef.current = now
+      } else if (now - lastMotionSeenAtRef.current > MOTION_CLEAR_MS) {
+        motionActiveRef.current = false
+      }
+
       if (
+        !motionActiveRef.current &&
         allowedByPersonFilter &&
         shouldTriggerMotion({
           analysis: nextAnalysis,
@@ -1423,6 +1523,7 @@ function RecorderPanel({
           lastTriggerAt: lastTriggerAtRef.current,
         })
       ) {
+        motionActiveRef.current = true
         lastTriggerAtRef.current = now
         void onSaveEvent(
           buildEvent({
@@ -2343,22 +2444,30 @@ async function acceptMonitorConnection(input: {
   input.seenCandidateIdsRef.current = new Set()
 
   const peer = createPeerConnection()
+  let sentCandidateCount = 0
+  let lastStateWrite = ''
   input.peerRef.current = peer
   input.stream.getTracks().forEach((track) => peer.addTrack(track, input.stream))
   peer.oniceconnectionstatechange = () => {
     if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
-      void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
-        state: 'connected',
-        updatedAt: nowIso(),
-      })
+      if (lastStateWrite !== 'connected') {
+        lastStateWrite = 'connected'
+        void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
+          state: 'connected',
+          updatedAt: nowIso(),
+        }).catch(() => undefined)
+      }
       return
     }
 
     if (peer.iceConnectionState === 'failed') {
-      void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
-        state: 'failed',
-        updatedAt: nowIso(),
-      })
+      if (lastStateWrite !== 'failed') {
+        lastStateWrite = 'failed'
+        void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
+          state: 'failed',
+          updatedAt: nowIso(),
+        }).catch(() => undefined)
+      }
     }
   }
   peer.onicecandidate = (event) => {
@@ -2366,6 +2475,11 @@ async function acceptMonitorConnection(input: {
       return
     }
 
+    if (sentCandidateCount >= MAX_ICE_CANDIDATES_PER_SIDE) {
+      return
+    }
+
+    sentCandidateCount += 1
     const candidate: IceCandidateDoc = {
       id: createId('ice'),
       connectionId: input.connection.id,
@@ -2373,7 +2487,9 @@ async function acceptMonitorConnection(input: {
       candidate: event.candidate.toJSON(),
       createdAt: nowIso(),
     }
-    void input.repository.addCandidate(input.uid, input.roomId, input.connection.id, candidate)
+    void input.repository
+      .addCandidate(input.uid, input.roomId, input.connection.id, candidate)
+      .catch(() => undefined)
   }
 
   if (!input.connection.offer) {
@@ -2460,7 +2576,7 @@ function getDeviceName(role: DeviceRole) {
 }
 
 function isDeviceOnline(device: MotionCueDevice) {
-  return device.online && Date.now() - new Date(device.lastSeenAt).getTime() < 180000
+  return device.online && Date.now() - new Date(device.lastSeenAt).getTime() < ONLINE_GRACE_MS
 }
 
 function latestDeviceText(devices: MotionCueDevice[], role: DeviceRole) {
@@ -2492,7 +2608,29 @@ function personStatusText(result: PersonDetectionResult) {
 }
 
 function formatUnknownError(error: unknown, fallback: string) {
+  if (isQuotaError(error)) {
+    return 'Firestore quota is exhausted, so MotionCue cloud sync is paused until Firebase allows writes again.'
+  }
+
   return error instanceof Error ? error.message : fallback
+}
+
+function isQuotaError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  const code =
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+      ? error.code
+      : ''
+  const normalized = `${code} ${message}`.toLowerCase()
+
+  return normalized.includes('resource-exhausted') || normalized.includes('quota')
+}
+
+function settingsSignature(settings: RecorderSettings) {
+  return JSON.stringify(normalizeSettings(settings))
 }
 
 function formatDate(value: string) {
