@@ -1,7 +1,7 @@
 import express from 'express'
 import https from 'node:https'
 import fs from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,7 @@ const localDir = path.join(rootDir, '.local')
 const certPath = path.join(localDir, 'motioncue-cert.pem')
 const keyPath = path.join(localDir, 'motioncue-key.pem')
 const metaPath = path.join(localDir, 'motioncue-cert-meta.json')
+const clipsDir = path.join(localDir, 'clips')
 const port = Number(process.env.MOTIONCUE_PORT || 8787)
 const host = '0.0.0.0'
 const lanIps = getLanIps()
@@ -52,6 +53,97 @@ app.get('/motioncue-server.json', (_request, response) => {
     lanUrls,
     preferredJoinUrl: lanUrls[0] ?? `https://localhost:${port}/`,
   })
+})
+
+app.get('/api/rooms/:roomId/clips', (request, response) => {
+  const room = getRoom(cleanId(request.params.roomId))
+  response.json({ clips: room.clips })
+})
+
+app.post(
+  '/api/rooms/:roomId/clips/:clipId',
+  express.raw({ type: '*/*', limit: '1024mb' }),
+  async (request, response) => {
+    const roomId = cleanId(request.params.roomId)
+    const clipId = cleanId(request.params.clipId)
+    const room = getRoom(roomId)
+    const body = Buffer.isBuffer(request.body) ? request.body : Buffer.from([])
+
+    if (!body.length) {
+      response.status(400).json({ error: 'Clip body is empty.' })
+      return
+    }
+
+    const mimeType =
+      typeof request.headers['content-type'] === 'string'
+        ? request.headers['content-type']
+        : 'video/webm'
+    const fileName = `${clipId}${extensionForMime(mimeType)}`
+    const roomClipDir = clipRoomDir(roomId)
+    const filePath = path.join(roomClipDir, fileName)
+    const now = new Date().toISOString()
+    const clip = {
+      id: clipId,
+      roomId,
+      eventId: cleanId(request.query.eventId?.toString() ?? `evt-${clipId}`),
+      deviceId: cleanId(request.query.deviceId?.toString() ?? 'recorder'),
+      startedAt: safeIso(request.query.startedAt?.toString(), now),
+      endedAt: safeIso(request.query.endedAt?.toString(), now),
+      durationMs: numberFromQuery(request.query.durationMs, 0),
+      size: body.length,
+      mimeType,
+      fileName,
+      url: `/api/rooms/${roomId}/clips/${clipId}`,
+      createdAt: now,
+    }
+
+    await fs.mkdir(roomClipDir, { recursive: true })
+    await fs.writeFile(filePath, body)
+    room.clips = [clip, ...room.clips.filter((entry) => entry.id !== clip.id)].slice(0, 250)
+    await saveClipIndex(room)
+    broadcastRoomState(room)
+    response.json({ clip })
+  },
+)
+
+app.get('/api/rooms/:roomId/clips/:clipId', (request, response) => {
+  const roomId = cleanId(request.params.roomId)
+  const clipId = cleanId(request.params.clipId)
+  const room = getRoom(roomId)
+  const clip = room.clips.find((entry) => entry.id === clipId)
+
+  if (!clip) {
+    response.status(404).json({ error: 'Clip not found.' })
+    return
+  }
+
+  const filePath = path.join(clipRoomDir(roomId), clip.fileName)
+
+  if (!existsSync(filePath)) {
+    response.status(404).json({ error: 'Clip file not found.' })
+    return
+  }
+
+  response.setHeader('Content-Type', clip.mimeType)
+  response.setHeader('Content-Length', String(clip.size))
+  response.setHeader('Accept-Ranges', 'bytes')
+  createReadStream(filePath).pipe(response)
+})
+
+app.delete('/api/rooms/:roomId/clips/:clipId', async (request, response) => {
+  const roomId = cleanId(request.params.roomId)
+  const clipId = cleanId(request.params.clipId)
+  const room = getRoom(roomId)
+  const clip = room.clips.find((entry) => entry.id === clipId)
+
+  if (clip) {
+    await fs.rm(path.join(clipRoomDir(roomId), clip.fileName), { force: true })
+    room.clips = room.clips.filter((entry) => entry.id !== clipId)
+    await saveClipIndex(room)
+    broadcastRoomState(room)
+  }
+
+  response.json({ ok: true })
 })
 
 app.use(
@@ -322,9 +414,38 @@ function getRoom(roomId) {
     devices: new Map(),
     events: [],
     settings: defaultSettings,
+    clips: readClipIndex(roomId),
   }
   rooms.set(roomId, room)
   return room
+}
+
+function clipRoomDir(roomId) {
+  return path.join(clipsDir, cleanId(roomId))
+}
+
+function clipIndexPath(roomId) {
+  return path.join(clipRoomDir(roomId), 'index.json')
+}
+
+function readClipIndex(roomId) {
+  const indexPath = clipIndexPath(roomId)
+
+  if (!existsSync(indexPath)) {
+    return []
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(indexPath, 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter(isClipMetadata) : []
+  } catch {
+    return []
+  }
+}
+
+async function saveClipIndex(room) {
+  await fs.mkdir(clipRoomDir(room.id), { recursive: true })
+  await fs.writeFile(clipIndexPath(room.id), JSON.stringify(room.clips, null, 2))
 }
 
 function snapshot(room) {
@@ -332,6 +453,7 @@ function snapshot(room) {
     settings: room.settings,
     devices: [...room.devices.values()],
     events: room.events,
+    clips: room.clips,
   }
 }
 
@@ -367,6 +489,39 @@ function parseMessage(raw) {
 
 function cleanId(value) {
   return value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'local-room'
+}
+
+function extensionForMime(mimeType) {
+  if (mimeType.includes('mp4')) {
+    return '.mp4'
+  }
+
+  return '.webm'
+}
+
+function safeIso(value, fallback) {
+  if (!value) {
+    return fallback
+  }
+
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date.toISOString() : fallback
+}
+
+function numberFromQuery(value, fallback) {
+  const raw = Array.isArray(value) ? value[0] : value
+  const number = Number(raw)
+  return Number.isFinite(number) ? Math.max(0, Math.round(number)) : fallback
+}
+
+function isClipMetadata(value) {
+  return (
+    value &&
+    typeof value.id === 'string' &&
+    typeof value.roomId === 'string' &&
+    typeof value.fileName === 'string' &&
+    typeof value.url === 'string'
+  )
 }
 
 function normalizeSettings(settings) {

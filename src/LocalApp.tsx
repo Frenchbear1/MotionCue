@@ -66,6 +66,21 @@ type ServerInfo = {
   preferredJoinUrl: string
 }
 
+type ServerClip = {
+  id: string
+  roomId: string
+  eventId: string
+  deviceId: string
+  startedAt: string
+  endedAt: string
+  durationMs: number
+  size: number
+  mimeType: string
+  fileName: string
+  url: string
+  createdAt: string
+}
+
 type SignalPayload =
   | { kind: 'offer'; description: SignalingDescription }
   | { kind: 'answer'; description: SignalingDescription }
@@ -101,6 +116,7 @@ type ServerMessage =
       settings: RecorderSettings
       devices: MotionCueDevice[]
       events: MotionCueEvent[]
+      clips?: ServerClip[]
       localUrls?: string[]
       lanUrls?: string[]
       preferredJoinUrl?: string
@@ -146,6 +162,7 @@ export default function LocalApp() {
   const [settings, setSettings] = useState<RecorderSettings>(defaultSettings)
   const [devices, setDevices] = useState<MotionCueDevice[]>([])
   const [events, setEvents] = useState<MotionCueEvent[]>([])
+  const [serverClips, setServerClips] = useState<ServerClip[]>([])
   const [signals, setSignals] = useState<SignalEnvelope[]>([])
   const handleSocketEvent = useCallback((event: MotionCueEvent) => {
     setEvents((current) => [event, ...current.filter((entry) => entry.id !== event.id)].slice(0, 80))
@@ -166,6 +183,7 @@ export default function LocalApp() {
     onSettings: setSettings,
     onDevices: setDevices,
     onEvents: setEvents,
+    onClips: setServerClips,
     onEvent: handleSocketEvent,
     onSignal: handleSocketSignal,
   })
@@ -228,8 +246,28 @@ export default function LocalApp() {
   const handleClipSaved = useCallback(
     (clip: LocalClip) => {
       void localClips.addClip(clip)
+      void uploadServerClip(roomId, clip)
+        .then((serverClip) => {
+          setServerClips((current) => [
+            serverClip,
+            ...current.filter((entry) => entry.id !== serverClip.id),
+          ])
+        })
+        .catch((error: unknown) => {
+          console.warn('MotionCue clip upload failed', error)
+        })
     },
-    [localClips],
+    [localClips, roomId],
+  )
+
+  const handleServerClipDelete = useCallback(
+    (clipId: string) => {
+      setServerClips((current) => current.filter((clip) => clip.id !== clipId))
+      void deleteServerClip(roomId, clipId).catch((error: unknown) => {
+        console.warn('MotionCue clip delete failed', error)
+      })
+    },
+    [roomId],
   )
 
   const recorderUrl = useMemo(
@@ -301,8 +339,11 @@ export default function LocalApp() {
                   <ClipsPanel
                     clips={localClips.clips}
                     events={events}
+                    roomId={roomId}
+                    serverClips={serverClips}
                     storageEstimate={localClips.estimate}
                     onClipDelete={(clipId) => void localClips.removeClip(clipId)}
+                    onServerClipDelete={handleServerClipDelete}
                   />
                 ) : null}
                 {view === 'settings' ? (
@@ -1195,7 +1236,7 @@ function RecorderControls({
 
         <ToggleRow
           title="Record on motion"
-          body="Save clips to this phone only."
+          body="Save clips to this phone and the laptop server."
           checked={settings.recordOnMotion}
           onChange={(checked) => onChange({ recordOnMotion: checked })}
         />
@@ -1219,13 +1260,19 @@ function RecorderControls({
 function ClipsPanel({
   clips,
   events,
+  roomId,
+  serverClips,
   storageEstimate,
   onClipDelete,
+  onServerClipDelete,
 }: {
   clips: LocalClip[]
   events: MotionCueEvent[]
+  roomId: string
+  serverClips: ServerClip[]
   storageEstimate: { used: number; quota: number; percent: number }
   onClipDelete: (clipId: string) => void
+  onServerClipDelete: (clipId: string) => void
 }) {
   const savedEvents = events.filter((event) => event.type === 'recording_saved')
 
@@ -1234,8 +1281,8 @@ function ClipsPanel({
       <section className={panelClass}>
         <div className="mb-4 flex items-center justify-between gap-3">
           <div>
-            <h2 className="text-xl font-semibold text-stone-950">Phone storage</h2>
-            <p className="text-sm text-stone-500">Manual export and delete only.</p>
+            <h2 className="text-xl font-semibold text-stone-950">Clip storage</h2>
+            <p className="text-sm text-stone-500">Shared clips live on this laptop.</p>
           </div>
           <Download size={22} className="text-stone-400" />
         </div>
@@ -1252,21 +1299,51 @@ function ClipsPanel({
           <Metric label="Used" value={formatBytes(storageEstimate.used)} />
           <Metric label="Quota" value={storageEstimate.quota ? formatBytes(storageEstimate.quota) : 'Unknown'} />
         </div>
+        <div className="mt-4 grid grid-cols-2 gap-3">
+          <Metric label="Shared" value={`${serverClips.length}`} />
+          <Metric
+            label="Laptop"
+            value={formatBytes(serverClips.reduce((total, clip) => total + clip.size, 0))}
+          />
+        </div>
       </section>
 
       <section className="space-y-3">
+        {serverClips.length ? (
+          <>
+            <div className="px-1">
+              <h2 className="text-lg font-semibold text-stone-950">Shared clips</h2>
+              <p className="text-sm text-stone-500">Available to devices connected to this server.</p>
+            </div>
+            {serverClips.map((clip) => (
+              <ServerClipCard
+                key={clip.id}
+                clip={clip}
+                roomId={roomId}
+                onDelete={onServerClipDelete}
+              />
+            ))}
+          </>
+        ) : null}
+
         {clips.length ? (
-          clips.map((clip) => (
-            <ClipCard key={clip.id} clip={clip} onDelete={onClipDelete} />
-          ))
-        ) : (
+          <>
+            <div className="px-1 pt-2">
+              <h2 className="text-lg font-semibold text-stone-950">This device</h2>
+              <p className="text-sm text-stone-500">Phone-local backup copies.</p>
+            </div>
+            {clips.map((clip) => (
+              <ClipCard key={clip.id} clip={clip} onDelete={onClipDelete} />
+            ))}
+          </>
+        ) : serverClips.length ? null : (
           <EmptyState
             Icon={Video}
-            title="No local clips"
+            title="No clips yet"
             body={
               savedEvents.length
-                ? 'This device has saved-clip metadata, but no local blobs.'
-                : 'Armed motion recordings appear here on the phone.'
+                ? 'Saved clip metadata exists, but no playable clip has synced here yet.'
+                : 'Armed motion recordings appear here.'
             }
           />
         )}
@@ -1317,7 +1394,7 @@ function SettingsPanel({
           />
           <ToggleRow
             title="Record clips"
-            body="Clips stay in IndexedDB on the recorder phone."
+            body="Clips save on the phone and sync to the laptop server."
             checked={settings.recordOnMotion}
             onChange={(recordOnMotion) =>
               onSettingsChange(normalizeSettings({ ...settings, recordOnMotion }))
@@ -1374,6 +1451,7 @@ function useLocalSocket({
   onSettings,
   onDevices,
   onEvents,
+  onClips,
   onEvent,
   onSignal,
 }: {
@@ -1383,6 +1461,7 @@ function useLocalSocket({
   onSettings: (settings: RecorderSettings) => void
   onDevices: (devices: MotionCueDevice[]) => void
   onEvents: (events: MotionCueEvent[]) => void
+  onClips: (clips: ServerClip[]) => void
   onEvent: (event: MotionCueEvent) => void
   onSignal: (signal: SignalEnvelope) => void
 }) {
@@ -1483,6 +1562,7 @@ function useLocalSocket({
           onSettings(normalizeSettings(message.settings))
           onDevices(message.devices)
           onEvents(message.events)
+          onClips(message.clips ?? [])
 
           if (message.preferredJoinUrl || message.lanUrls || message.localUrls) {
             const nextServerInfo = {
@@ -1522,7 +1602,18 @@ function useLocalSocket({
       }
       socketRef.current?.close()
     }
-  }, [deviceId, onDevices, onEvent, onEvents, onSettings, onSignal, role, roomId, serverReady])
+  }, [
+    deviceId,
+    onClips,
+    onDevices,
+    onEvent,
+    onEvents,
+    onSettings,
+    onSignal,
+    role,
+    roomId,
+    serverReady,
+  ])
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -1696,6 +1787,55 @@ function ClipCard({
               <Download size={17} />
               Export
             </button>
+            <button
+              type="button"
+              onClick={() => onDelete(clip.id)}
+              className="pressable flex items-center justify-center gap-2 rounded-2xl bg-red-50 px-4 py-3 text-sm font-semibold text-red-700"
+            >
+              <Trash2 size={17} />
+              Delete
+            </button>
+          </div>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function ServerClipCard({
+  clip,
+  roomId,
+  onDelete,
+}: {
+  clip: ServerClip
+  roomId: string
+  onDelete: (clipId: string) => void
+}) {
+  const clipUrl = serverClipUrl(roomId, clip.id)
+
+  return (
+    <article className={panelClass}>
+      <div className="grid gap-4 sm:grid-cols-[12rem_1fr]">
+        <video
+          src={clipUrl}
+          controls
+          playsInline
+          className="aspect-video w-full rounded-2xl bg-stone-950 object-contain"
+        />
+        <div className="min-w-0">
+          <h2 className="text-lg font-semibold text-stone-950">{formatDate(clip.startedAt)}</h2>
+          <p className="mt-1 text-sm text-stone-500">
+            {Math.round(clip.durationMs / 1000)}s / {formatBytes(clip.size)}
+          </p>
+          <div className="mt-4 grid grid-cols-2 gap-3">
+            <a
+              href={clipUrl}
+              download={`motioncue-${clip.startedAt.replaceAll(':', '-')}.webm`}
+              className="pressable flex items-center justify-center gap-2 rounded-2xl bg-stone-950 px-4 py-3 text-sm font-semibold text-white"
+            >
+              <Download size={17} />
+              Export
+            </a>
             <button
               type="button"
               onClick={() => onDelete(clip.id)}
@@ -2050,6 +2190,44 @@ function buildRecorderUrl(serverInfo: ServerInfo | null, roomId: string) {
 
 function sendMessage(socket: WebSocket, message: ClientMessage) {
   socket.send(JSON.stringify(message))
+}
+
+async function uploadServerClip(roomId: string, clip: LocalClip) {
+  const params = new URLSearchParams({
+    eventId: clip.eventId,
+    deviceId: clip.deviceId,
+    startedAt: clip.startedAt,
+    endedAt: clip.endedAt,
+    durationMs: String(clip.durationMs),
+  })
+  const response = await fetch(`${serverClipUrl(roomId, clip.id)}?${params}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': clip.mimeType || 'video/webm',
+    },
+    body: clip.blob,
+  })
+
+  if (!response.ok) {
+    throw new Error('Could not upload shared clip.')
+  }
+
+  const data = (await response.json()) as { clip: ServerClip }
+  return data.clip
+}
+
+async function deleteServerClip(roomId: string, clipId: string) {
+  const response = await fetch(serverClipUrl(roomId, clipId), {
+    method: 'DELETE',
+  })
+
+  if (!response.ok) {
+    throw new Error('Could not delete shared clip.')
+  }
+}
+
+function serverClipUrl(roomId: string, clipId: string) {
+  return `/api/rooms/${encodeURIComponent(roomId)}/clips/${encodeURIComponent(clipId)}`
 }
 
 function parseServerMessage(raw: unknown): ServerMessage | null {
