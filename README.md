@@ -4,6 +4,11 @@ MotionCue is a local-first PWA for using a phone as a motion-triggered camera an
 
 Video and motion-triggered clips stay on the recording phone in IndexedDB. The app does not use Firebase Storage, Cloud Functions, or any paid relay service.
 
+## Hosted App
+
+- App: https://frenchbear1.github.io/MotionCue/
+- Repo: https://github.com/Frenchbear1/MotionCue
+
 ## Local Development
 
 ```bash
@@ -12,6 +17,13 @@ npm run dev
 ```
 
 The Firebase config is in `.env.local`. Deploy `firestore.rules` to the Firebase project before using a hosted app.
+
+## Firebase Console Setup
+
+1. In Firebase Authentication, enable Google sign-in and Email/Password sign-in.
+2. In Firebase Authentication settings, add `frenchbear1.github.io` to Authorized domains.
+3. Create a Cloud Firestore database if one does not exist.
+4. Publish the included `firestore.rules` file, or run `firebase deploy --only firestore:rules` after logging in with Firebase CLI.
 
 For GitHub Pages deployment, add these repository secrets before running the included workflow:
 
