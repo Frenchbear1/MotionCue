@@ -147,6 +147,12 @@ export default function LocalApp() {
   const [devices, setDevices] = useState<MotionCueDevice[]>([])
   const [events, setEvents] = useState<MotionCueEvent[]>([])
   const [signals, setSignals] = useState<SignalEnvelope[]>([])
+  const handleSocketEvent = useCallback((event: MotionCueEvent) => {
+    setEvents((current) => [event, ...current.filter((entry) => entry.id !== event.id)].slice(0, 80))
+  }, [])
+  const handleSocketSignal = useCallback((signal: SignalEnvelope) => {
+    setSignals((current) => [...current.slice(-40), signal])
+  }, [])
   const localClips = useLocalClips(roomId)
   const {
     connected,
@@ -160,9 +166,8 @@ export default function LocalApp() {
     onSettings: setSettings,
     onDevices: setDevices,
     onEvents: setEvents,
-    onEvent: (event) =>
-      setEvents((current) => [event, ...current.filter((entry) => entry.id !== event.id)].slice(0, 80)),
-    onSignal: (signal) => setSignals((current) => [...current.slice(-40), signal]),
+    onEvent: handleSocketEvent,
+    onSignal: handleSocketSignal,
   })
 
   useEffect(() => {
@@ -348,9 +353,11 @@ function MonitorPanel({
 }) {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null)
   const peerRef = useRef<RTCPeerConnection | null>(null)
+  const latestOfferRef = useRef<SignalingDescription | null>(null)
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([])
   const processedSignalsRef = useRef<Set<string>>(new Set())
   const autoStartedRef = useRef(false)
+  const lastOfferSentAtRef = useRef(0)
   const [connectionLabel, setConnectionLabel] = useState('Waiting')
   const [isOpening, setIsOpening] = useState(false)
   const [qrUrl, setQrUrl] = useState('')
@@ -386,6 +393,7 @@ function MonitorPanel({
   const stopMonitor = useCallback(() => {
     peerRef.current?.close()
     peerRef.current = null
+    latestOfferRef.current = null
     pendingCandidatesRef.current = []
     setIsOpening(false)
     setConnectionLabel('Stopped')
@@ -438,10 +446,12 @@ function MonitorPanel({
     try {
       const offer = await peer.createOffer()
       await peer.setLocalDescription(offer)
+      latestOfferRef.current = toSignalingDescription(peer.localDescription)
       const sent = sendSignal(
-        { kind: 'offer', description: toSignalingDescription(peer.localDescription) },
+        { kind: 'offer', description: latestOfferRef.current },
         'recorder',
       )
+      lastOfferSentAtRef.current = Date.now()
       setConnectionLabel(sent ? 'Waiting for phone' : 'Server offline')
       setIsOpening(false)
     } catch (error) {
@@ -458,6 +468,30 @@ function MonitorPanel({
     autoStartedRef.current = true
     void startMonitor()
   }, [connected, startMonitor])
+
+  useEffect(() => {
+    if (
+      !connected ||
+      !recorderOnline ||
+      !latestOfferRef.current ||
+      connectionLabel === 'Receiving video'
+    ) {
+      return
+    }
+
+    const now = Date.now()
+
+    if (now - lastOfferSentAtRef.current < 1200) {
+      return
+    }
+
+    const sent = sendSignal({ kind: 'offer', description: latestOfferRef.current }, 'recorder')
+    lastOfferSentAtRef.current = now
+
+    if (sent) {
+      setConnectionLabel('Waiting for phone')
+    }
+  }, [connected, connectionLabel, recorderOnline, sendSignal])
 
   useEffect(() => {
     signals.forEach((signal) => {
@@ -1354,16 +1388,20 @@ function useLocalSocket({
 }) {
   const socketRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<number | null>(null)
+  const reconnectAttemptRef = useRef(0)
   const [connected, setConnected] = useState(false)
   const [serverError, setServerError] = useState('')
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null)
+  const serverReady = Boolean(serverInfo)
 
   useEffect(() => {
     let cancelled = false
 
     void fetch('/motioncue-server.json', { cache: 'no-store' })
       .then((response) => {
-        if (!response.ok) {
+        const contentType = response.headers.get('content-type') ?? ''
+
+        if (!response.ok || !contentType.includes('application/json')) {
           throw new Error('Local server manifest unavailable.')
         }
 
@@ -1372,6 +1410,7 @@ function useLocalSocket({
       .then((info) => {
         if (!cancelled) {
           setServerInfo(info)
+          setServerError('')
         }
       })
       .catch((error: unknown) => {
@@ -1386,7 +1425,21 @@ function useLocalSocket({
   }, [])
 
   useEffect(() => {
+    if (!serverReady) {
+      return
+    }
+
     let cancelled = false
+
+    const scheduleReconnect = () => {
+      if (cancelled) {
+        return
+      }
+
+      const delay = Math.min(12000, 1200 * 2 ** reconnectAttemptRef.current)
+      reconnectAttemptRef.current += 1
+      reconnectTimerRef.current = window.setTimeout(connect, delay)
+    }
 
     const connect = () => {
       if (cancelled) {
@@ -1404,15 +1457,17 @@ function useLocalSocket({
       socketRef.current = socket
 
       socket.onopen = () => {
+        reconnectAttemptRef.current = 0
         setConnected(true)
         setServerError('')
         sendMessage(socket, { type: 'presence', roomId })
       }
       socket.onclose = () => {
-        setConnected(false)
-        if (!cancelled) {
-          reconnectTimerRef.current = window.setTimeout(connect, 1500)
+        if (socketRef.current === socket) {
+          socketRef.current = null
         }
+        setConnected(false)
+        scheduleReconnect()
       }
       socket.onerror = () => {
         setServerError('Local server connection failed.')
@@ -1430,11 +1485,14 @@ function useLocalSocket({
           onEvents(message.events)
 
           if (message.preferredJoinUrl || message.lanUrls || message.localUrls) {
-            setServerInfo({
+            const nextServerInfo = {
               preferredJoinUrl: message.preferredJoinUrl ?? window.location.origin,
               lanUrls: message.lanUrls ?? [],
               localUrls: message.localUrls ?? [window.location.origin],
-            })
+            }
+            setServerInfo((current) =>
+              serverInfoMatches(current, nextServerInfo) ? current : nextServerInfo,
+            )
           }
           return
         }
@@ -1464,7 +1522,7 @@ function useLocalSocket({
       }
       socketRef.current?.close()
     }
-  }, [deviceId, onDevices, onEvent, onEvents, onSettings, onSignal, role, roomId])
+  }, [deviceId, onDevices, onEvent, onEvents, onSettings, onSignal, role, roomId, serverReady])
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -2004,6 +2062,18 @@ function parseServerMessage(raw: unknown): ServerMessage | null {
   } catch {
     return null
   }
+}
+
+function serverInfoMatches(left: ServerInfo | null, right: ServerInfo) {
+  if (!left) {
+    return false
+  }
+
+  return (
+    left.preferredJoinUrl === right.preferredJoinUrl &&
+    left.lanUrls.join('|') === right.lanUrls.join('|') &&
+    left.localUrls.join('|') === right.localUrls.join('|')
+  )
 }
 
 function getDeviceName(role: DeviceRole) {
