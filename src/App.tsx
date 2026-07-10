@@ -693,6 +693,7 @@ function Workspace({
                 session={session}
                 repository={repository}
                 deviceId={deviceId}
+                connections={connections}
                 recorderOnline={recorderOnline}
                 monitorOnline={monitorOnline}
                 events={events}
@@ -748,6 +749,7 @@ function MonitorPanel({
   session,
   repository,
   deviceId,
+  connections,
   recorderOnline,
   monitorOnline,
   events,
@@ -758,6 +760,7 @@ function MonitorPanel({
   session: SessionUser
   repository: MotionCueRepository
   deviceId: string
+  connections: SignalingConnection[]
   recorderOnline: boolean
   monitorOnline: boolean
   events: MotionCueEvent[]
@@ -775,8 +778,16 @@ function MonitorPanel({
   const [notificationPermission, setNotificationPermission] = useState(() =>
     'Notification' in window ? Notification.permission : 'denied',
   )
+  const autoStartedRef = useRef(false)
   const recorderUrl = useMemo(() => buildRecorderUrl(room.id), [room.id])
   const recentEvents = events.slice(0, 12)
+  const activeConnection = useMemo(
+    () =>
+      connectionId
+        ? connections.find((connection) => connection.id === connectionId) ?? null
+        : null,
+    [connectionId, connections],
+  )
 
   useEffect(() => {
     void QRCode.toDataURL(recorderUrl, {
@@ -801,9 +812,16 @@ function MonitorPanel({
         }
 
         if (!peerRef.current.currentRemoteDescription) {
-          void peerRef.current.setRemoteDescription(connection.answer)
-          setConnectionLabel('Receiving video')
-          setIsConnecting(false)
+          void peerRef.current
+            .setRemoteDescription(connection.answer)
+            .then(() => {
+              setConnectionLabel('Receiving video')
+              setIsConnecting(false)
+            })
+            .catch((error: unknown) => {
+              setConnectionLabel(formatUnknownError(error, 'Could not receive video.'))
+              setIsConnecting(false)
+            })
         }
       },
       setConnectionLabel,
@@ -830,59 +848,7 @@ function MonitorPanel({
     }
   }, [connectionId, deviceId, repository, room.id, session.uid])
 
-  const startMonitor = async () => {
-    stopMonitor()
-    setIsConnecting(true)
-    setConnectionLabel('Opening monitor')
-    seenCandidateIdsRef.current = new Set()
-
-    const nextConnectionId = createId('conn')
-    const peer = createPeerConnection()
-    peerRef.current = peer
-    peer.addTransceiver('video', { direction: 'recvonly' })
-    peer.ontrack = (event) => {
-      const stream = event.streams[0]
-
-      if (remoteVideoRef.current && stream) {
-        remoteVideoRef.current.srcObject = stream
-      }
-    }
-    peer.oniceconnectionstatechange = () => {
-      setConnectionLabel(peer.iceConnectionState)
-    }
-    peer.onicecandidate = (event) => {
-      if (!event.candidate) {
-        return
-      }
-
-      const candidate: IceCandidateDoc = {
-        id: createId('ice'),
-        connectionId: nextConnectionId,
-        fromDeviceId: deviceId,
-        candidate: event.candidate.toJSON(),
-        createdAt: nowIso(),
-      }
-      void repository.addCandidate(session.uid, room.id, nextConnectionId, candidate)
-    }
-
-    const offer = await peer.createOffer()
-    await peer.setLocalDescription(offer)
-    await repository.createConnection(session.uid, room.id, {
-      id: nextConnectionId,
-      roomId: room.id,
-      monitorDeviceId: deviceId,
-      recorderDeviceId: null,
-      state: 'offer',
-      offer: toSignalingDescription(peer.localDescription),
-      answer: null,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    })
-    setConnectionId(nextConnectionId)
-    setConnectionLabel('Waiting for phone')
-  }
-
-  const stopMonitor = () => {
+  const stopMonitor = useCallback(() => {
     peerRef.current?.close()
     peerRef.current = null
 
@@ -900,7 +866,111 @@ function MonitorPanel({
     setConnectionId(null)
     setIsConnecting(false)
     setConnectionLabel('Not connected')
-  }
+  }, [connectionId, repository, room.id, session.uid])
+
+  const startMonitor = useCallback(async () => {
+    if (isConnecting || peerRef.current) {
+      return
+    }
+
+    setIsConnecting(true)
+    setConnectionLabel('Opening monitor')
+    seenCandidateIdsRef.current = new Set()
+
+    const nextConnectionId = createId('conn')
+    const peer = createPeerConnection()
+    peerRef.current = peer
+    peer.addTransceiver('video', { direction: 'recvonly' })
+    peer.ontrack = (event) => {
+      const stream = event.streams[0]
+
+      if (remoteVideoRef.current && stream) {
+        remoteVideoRef.current.srcObject = stream
+      }
+    }
+    peer.oniceconnectionstatechange = () => {
+      setConnectionLabel(peer.iceConnectionState)
+      if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
+        setIsConnecting(false)
+        void repository.updateConnection(session.uid, room.id, nextConnectionId, {
+          state: 'connected',
+          updatedAt: nowIso(),
+        })
+      }
+
+      if (peer.iceConnectionState === 'failed') {
+        setIsConnecting(false)
+        void repository.updateConnection(session.uid, room.id, nextConnectionId, {
+          state: 'failed',
+          updatedAt: nowIso(),
+        })
+      }
+
+      if (peer.iceConnectionState === 'disconnected') {
+        setIsConnecting(false)
+      }
+    }
+    peer.onicecandidate = (event) => {
+      if (!event.candidate) {
+        return
+      }
+
+      const candidate: IceCandidateDoc = {
+        id: createId('ice'),
+        connectionId: nextConnectionId,
+        fromDeviceId: deviceId,
+        candidate: event.candidate.toJSON(),
+        createdAt: nowIso(),
+      }
+      void repository.addCandidate(session.uid, room.id, nextConnectionId, candidate)
+    }
+
+    try {
+      const offer = await peer.createOffer()
+      await peer.setLocalDescription(offer)
+      await repository.createConnection(session.uid, room.id, {
+        id: nextConnectionId,
+        roomId: room.id,
+        monitorDeviceId: deviceId,
+        recorderDeviceId: null,
+        state: 'offer',
+        offer: toSignalingDescription(peer.localDescription),
+        answer: null,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+      })
+      setConnectionId(nextConnectionId)
+      setConnectionLabel('Waiting for phone')
+    } catch (error) {
+      peer.close()
+      peerRef.current = null
+      setIsConnecting(false)
+      setConnectionLabel(formatUnknownError(error, 'Could not start monitor.'))
+    }
+  }, [deviceId, isConnecting, repository, room.id, session.uid])
+
+  useEffect(() => {
+    if (autoStartedRef.current || connectionId || peerRef.current) {
+      return
+    }
+
+    autoStartedRef.current = true
+    void startMonitor()
+  }, [connectionId, startMonitor])
+
+  useEffect(() => {
+    if (!activeConnection || !peerRef.current) {
+      return
+    }
+
+    if (activeConnection.state === 'closed' || activeConnection.state === 'failed') {
+      peerRef.current.close()
+      peerRef.current = null
+      setConnectionId(null)
+      setIsConnecting(false)
+      setConnectionLabel(activeConnection.state)
+    }
+  }, [activeConnection])
 
   const copyLink = async () => {
     await navigator.clipboard.writeText(recorderUrl)
@@ -940,7 +1010,10 @@ function MonitorPanel({
           <div className="absolute bottom-4 left-4 right-4 flex flex-wrap gap-3">
             <button
               type="button"
-              onClick={() => void startMonitor()}
+              onClick={() => {
+                stopMonitor()
+                window.setTimeout(() => void startMonitor(), 0)
+              }}
               disabled={isConnecting}
               className="pressable flex items-center justify-center gap-2 rounded-2xl bg-white px-5 py-3 text-sm font-semibold text-stone-950 shadow-lg disabled:opacity-60"
             >
@@ -1124,7 +1197,13 @@ function RecorderPanel({
         connection.monitorDeviceId !== deviceId,
     )
 
-    if (!pending || !streamRef.current || acceptingConnectionRef.current) {
+    if (
+      !cameraReady ||
+      !pending ||
+      !streamRef.current ||
+      acceptingConnectionRef.current ||
+      recorderConnectionId === pending.id
+    ) {
       return
     }
 
@@ -1142,7 +1221,15 @@ function RecorderPanel({
     }).finally(() => {
       acceptingConnectionRef.current = false
     })
-  }, [connections, deviceId, repository, room.id, session.uid])
+  }, [
+    cameraReady,
+    connections,
+    deviceId,
+    recorderConnectionId,
+    repository,
+    room.id,
+    session.uid,
+  ])
 
   useEffect(() => {
     if (!recorderConnectionId) {
@@ -2230,6 +2317,22 @@ async function acceptMonitorConnection(input: {
   const peer = createPeerConnection()
   input.peerRef.current = peer
   input.stream.getTracks().forEach((track) => peer.addTrack(track, input.stream))
+  peer.oniceconnectionstatechange = () => {
+    if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
+      void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
+        state: 'connected',
+        updatedAt: nowIso(),
+      })
+      return
+    }
+
+    if (peer.iceConnectionState === 'failed') {
+      void input.repository.updateConnection(input.uid, input.roomId, input.connection.id, {
+        state: 'failed',
+        updatedAt: nowIso(),
+      })
+    }
+  }
   peer.onicecandidate = (event) => {
     if (!event.candidate) {
       return
